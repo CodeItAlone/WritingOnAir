@@ -3,6 +3,8 @@ import numpy as np
 import mediapipe as mp
 from datetime import datetime
 
+from shape_autocorrect import autocorrect_stroke  # shape snapping
+
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
@@ -10,21 +12,22 @@ mp_drawing = mp.solutions.drawing_utils
 # Config
 
 MAX_NUM_HANDS = 1
-DEFAULT_BRUSH_THICKNESS = 5
-ERASER_THICKNESS = 40          # thickness for eraser "line"
-SENSITIVITY = 1.8              # >1 = amplify hand motion
-MAX_LOST_FRAMES = 2            # frames allowed with no hand before killing prev point
-SMOOTH_WINDOW = 4              # points for smoothing
+DEFAULT_BRUSH_THICKNESS = 3     # smaller marker (less bold)
+ERASER_THICKNESS = 40           # thickness for eraser "line"
+MAX_LOST_FRAMES = 2             # frames allowed with no hand before killing prev point
+SMOOTH_WINDOW = 4               # points for smoothing
 
 MIN_BRUSH = 1
 MAX_BRUSH = 50
+
+# How many frames a gesture must stay the same before mode actually changes
+MODE_STABLE_FRAMES = 3          # higher = more stable, lower = more responsive
 
 # Colors (BGR)
 COLOR_WHITE = (255, 255, 255)
 COLOR_RED   = (0,   0, 255)
 COLOR_GREEN = (0, 255,   0)
 COLOR_BLUE  = (255, 0,   0)
-
 
 
 # Utility: finger state helpers
@@ -89,25 +92,50 @@ def smooth_point(points_window, new_point):
     return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
 
 
-
-# Stroke replay (for undo)
+# Stroke replay (for undo / shapes)
 
 def redraw_canvas_from_strokes(canvas, strokes):
     canvas[:] = 0
     for stroke in strokes:
-        pts = stroke["points"]
-        if len(pts) < 2:
-            continue
         mode = stroke["mode"]
-        color = stroke["color"]
-        thickness = stroke["thickness"]
+
         if mode == "draw":
+            pts = stroke["points"]
+            if len(pts) < 2:
+                continue
+            color = stroke["color"]
+            thickness = stroke["thickness"]
             for i in range(1, len(pts)):
                 cv2.line(canvas, pts[i - 1], pts[i], color, thickness)
+
         elif mode == "erase":
+            pts = stroke["points"]
+            if len(pts) < 2:
+                continue
+            thickness = stroke["thickness"]
             for i in range(1, len(pts)):
                 cv2.line(canvas, pts[i - 1], pts[i], (0, 0, 0), thickness)
 
+        elif mode == "shape":
+            shape_type = stroke["shape_type"]
+            params = stroke["shape_params"]
+            color = stroke["color"]
+            thickness = stroke["thickness"]
+
+            if shape_type == "line":
+                x1, y1, x2, y2 = params
+                cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)),
+                         color, thickness, cv2.LINE_AA)
+
+            elif shape_type == "circle":
+                cx, cy, r = params
+                cv2.circle(canvas, (int(cx), int(cy)), int(r),
+                           color, thickness, cv2.LINE_AA)
+
+            elif shape_type in ("rectangle", "square"):
+                corners = [(int(x), int(y)) for x, y in params]
+                pts = np.array(corners + [corners[0]], dtype=np.int32)
+                cv2.polylines(canvas, [pts], True, color, thickness, cv2.LINE_AA)
 
 
 # Main
@@ -126,8 +154,6 @@ if not ret:
 h, w, _ = frame.shape
 canvas = np.zeros((h, w, 3), dtype=np.uint8)
 
-cx, cy = w // 2, h // 2  # center for scaling
-
 prev_x, prev_y = None, None
 lost_frames = 0
 
@@ -138,8 +164,12 @@ whiteboard_mode = False
 
 strokes = []           # history of strokes
 current_stroke = None  # active stroke
-prev_mode = None       # None / "draw" / "erase"
+prev_mode = None       # previous STABLE mode: None / "draw" / "erase"
 smooth_window = []     # for smoothing
+
+# Gesture mode smoothing
+raw_mode_prev = None
+mode_stable_count = 0  # how long current raw mode has been seen
 
 # Recording
 recording = False
@@ -174,7 +204,7 @@ while True:
 
     index_tip_point = None
     eraser_mode = False
-    pen_down = False
+    raw_mode = None  # "draw" / "erase" / None
 
     if result.multi_hand_landmarks:
         lost_frames = 0
@@ -187,58 +217,84 @@ while True:
         pinch = is_pinch_gesture(hand_landmarks)
         index_only = is_index_only_up_gesture(hand_landmarks)
 
+        # RAW mode from gestures (will be stabilized below)
         if eraser_mode:
-            pen_down = False
-            mode = "erase"
+            raw_mode = "erase"
         elif pinch:
-            pen_down = False
-            mode = None
+            raw_mode = None  # pen up
         elif index_only:
-            pen_down = True
-            mode = "draw"
+            raw_mode = "draw"
         else:
-            pen_down = False
-            mode = None
+            raw_mode = None
 
         lm = hand_landmarks.landmark
         raw_x = int(lm[8].x * w)
         raw_y = int(lm[8].y * h)
 
-        # Scale motion around center
-        scaled_x = int(cx + (raw_x - cx) * SENSITIVITY)
-        scaled_y = int(cy + (raw_y - cy) * SENSITIVITY)
-        scaled_x = max(0, min(w - 1, scaled_x))
-        scaled_y = max(0, min(h - 1, scaled_y))
-
-        # Smoothing
-        sm_x, sm_y = smooth_point(smooth_window, (scaled_x, scaled_y))
+        # Smooth the pointer in image space
+        sm_x, sm_y = smooth_point(smooth_window, (raw_x, raw_y))
         index_tip_point = (sm_x, sm_y)
 
-        # Show raw and scaled points for debug
-        cv2.circle(frame, (raw_x, raw_y), 4, (0, 0, 255), -1)
-        cv2.circle(frame, (sm_x, sm_y), 4, (255, 0, 0), 1)
+        # Pointer exactly at drawing position, a bit smaller now
+        cv2.circle(frame, (sm_x, sm_y), 4, (0, 255, 0), 1)
 
     else:
         lost_frames += 1
-        mode = None
+        raw_mode = None
         if lost_frames > MAX_LOST_FRAMES:
             prev_x, prev_y = None, None
             smooth_window = []
 
-    
-    # Handle stroke state (start/end/current)
-   
-    # Determine current drawing mode: "draw", "erase", or None
-    if not result.multi_hand_landmarks:
-        mode = None
+    # --------- STABILIZE MODE (gesture debouncing) ----------
+
+    # Update stable counter for raw_mode
+    if raw_mode == raw_mode_prev:
+        mode_stable_count = min(mode_stable_count + 1, MODE_STABLE_FRAMES)
+    else:
+        raw_mode_prev = raw_mode
+        mode_stable_count = 1
+
+    # Decide actual mode used for drawing/erasing
+    if mode_stable_count >= MODE_STABLE_FRAMES:
+        mode = raw_mode
+    else:
+        # keep previous stable mode until new raw_mode is stable enough
+        mode = prev_mode
+
+    # --------- Handle stroke state (start/end/current) ----------
 
     if mode != prev_mode:
-        # Close previous stroke if existed
-        if prev_mode in ("draw", "erase") and current_stroke is not None:
+        # Close previous stroke cleanly
+        if prev_mode == "draw" and current_stroke is not None:
+            pts = current_stroke["points"]
+
+            # Only try shape autocorrect if stroke has enough points
+            if len(pts) >= 5:
+                shape_type, shape_params = autocorrect_stroke(pts)
+            else:
+                shape_type, shape_params = (None, None)
+
+            if shape_type is not None:
+                shape_stroke = {
+                    "mode": "shape",
+                    "shape_type": shape_type,
+                    "shape_params": shape_params,
+                    "color": current_stroke["color"],
+                    "thickness": current_stroke["thickness"]
+                }
+                strokes.append(shape_stroke)
+            else:
+                strokes.append(current_stroke)
+
+            current_stroke = None
+            redraw_canvas_from_strokes(canvas, strokes)
+
+        elif prev_mode == "erase" and current_stroke is not None:
             strokes.append(current_stroke)
             current_stroke = None
+            redraw_canvas_from_strokes(canvas, strokes)
 
-        # Start new stroke if drawing/erasing
+        # Start new stroke if actually in a stable drawing/erasing mode
         if mode in ("draw", "erase") and index_tip_point is not None:
             current_stroke = {
                 "mode": mode,
@@ -247,16 +303,15 @@ while True:
                 "points": []
             }
             smooth_window = []  # reset smoothing for new stroke
-        prev_mode = mode
 
-    
-    # Drawing / Erasing Logic
-    
+        prev_mode = mode  # update stable previous mode AFTER handling transitions
+
+    # --------- Drawing / Erasing Logic ----------
+
     if index_tip_point is not None:
         x, y = index_tip_point
 
         if mode == "erase":
-            # Erase with thick black line
             if prev_x is not None and prev_y is not None:
                 cv2.line(canvas, (prev_x, prev_y), (x, y), (0, 0, 0), ERASER_THICKNESS)
             if current_stroke is not None:
@@ -265,7 +320,10 @@ while True:
 
         elif mode == "draw":
             if prev_x is not None and prev_y is not None:
-                cv2.line(canvas, (prev_x, prev_y), (x, y), current_stroke["color"], current_stroke["thickness"])
+                cv2.line(canvas, (prev_x, prev_y),
+                         (x, y),
+                         current_stroke["color"],
+                         current_stroke["thickness"])
             if current_stroke is not None:
                 current_stroke["points"].append((x, y))
             prev_x, prev_y = x, y
@@ -275,9 +333,8 @@ while True:
     else:
         prev_x, prev_y = None, None
 
-   
-    # Overlay + UI / Toolbar
-    
+    # --------- Overlay + UI / Toolbar ----------
+
     combined = cv2.addWeighted(frame, 0.5, canvas, 0.5, 0)
 
     if mode == "erase":
@@ -334,9 +391,8 @@ while True:
     cv2.imshow("Air Writing", display_frame)
     cv2.imshow("Canvas", canvas)
 
-    
-    # Key handling
-   
+    # --------- Key handling ----------
+
     key = cv2.waitKey(1) & 0xFF
 
     if key == ord('q'):
@@ -349,7 +405,6 @@ while True:
         print("[INFO] Canvas cleared.")
 
     if key == ord('b'):
-        # Soft clear / fade canvas
         canvas = (canvas * 0.7).astype(np.uint8)
         print("[INFO] Soft clear (fade) applied.")
 
@@ -360,7 +415,7 @@ while True:
         print(f"[INFO] Canvas saved as {filename}")
 
     if key == ord('z'):
-        # Finish current stroke before undo
+        # finish current stroke before undo (no need to autocorrect here, we remove it anyway)
         if current_stroke is not None:
             strokes.append(current_stroke)
             current_stroke = None
@@ -396,7 +451,24 @@ while True:
 
 # Close any remaining active stroke
 if current_stroke is not None:
-    strokes.append(current_stroke)
+    if current_stroke["mode"] == "draw":
+        pts = current_stroke["points"]
+        if len(pts) >= 5:
+            shape_type, shape_params = autocorrect_stroke(pts)
+        else:
+            shape_type, shape_params = (None, None)
+        if shape_type is not None:
+            strokes.append({
+                "mode": "shape",
+                "shape_type": shape_type,
+                "shape_params": shape_params,
+                "color": current_stroke["color"],
+                "thickness": current_stroke["thickness"]
+            })
+        else:
+            strokes.append(current_stroke)
+    else:
+        strokes.append(current_stroke)
 
 hands.close()
 cap.release()

@@ -2,476 +2,565 @@ import cv2
 import numpy as np
 import mediapipe as mp
 from datetime import datetime
+from collections import deque
 
-from shape_autocorrect import autocorrect_stroke  # shape snapping
+from shape_autocorrect import autocorrect_stroke
 
+# MediaPipe setup
 mp_hands = mp.solutions.hands
 mp_drawing = mp.solutions.drawing_utils
 
-
-# Config
-
-MAX_NUM_HANDS = 1
-DEFAULT_BRUSH_THICKNESS = 3     # smaller marker (less bold)
-ERASER_THICKNESS = 40           # thickness for eraser "line"
-MAX_LOST_FRAMES = 2             # frames allowed with no hand before killing prev point
-SMOOTH_WINDOW = 4               # points for smoothing
-
-MIN_BRUSH = 1
-MAX_BRUSH = 50
-
-# How many frames a gesture must stay the same before mode actually changes
-MODE_STABLE_FRAMES = 3          # higher = more stable, lower = more responsive
-
-# Colors (BGR)
-COLOR_WHITE = (255, 255, 255)
-COLOR_RED   = (0,   0, 255)
-COLOR_GREEN = (0, 255,   0)
-COLOR_BLUE  = (255, 0,   0)
-
-
-# Utility: finger state helpers
-
-def get_fingers_up(lm):
-    """
-    Returns [index_up, middle_up, ring_up, pinky_up]
-    based on tip vs pip y-coordinates.
-    """
-    tips = [8, 12, 16, 20]
-    pips = [6, 10, 14, 18]
-
-    fingers_up = []
-    for tip_idx, pip_idx in zip(tips, pips):
-        fingers_up.append(lm[tip_idx].y < lm[pip_idx].y)
-    return fingers_up
+# ==================== CONFIG ====================
+class Config:
+    MAX_NUM_HANDS = 1
+    DEFAULT_BRUSH_THICKNESS = 3
+    ERASER_THICKNESS = 40
+    MAX_LOST_FRAMES = 2
+    SMOOTH_WINDOW = 4
+    MIN_BRUSH = 1
+    MAX_BRUSH = 50
+    MODE_STABLE_FRAMES = 3
+    
+    # Colors (BGR)
+    COLOR_WHITE = (255, 255, 255)
+    COLOR_RED = (0, 0, 255)
+    COLOR_GREEN = (0, 255, 0)
+    COLOR_BLUE = (255, 0, 0)
+    
+    # Performance
+    DETECTION_CONFIDENCE = 0.5
+    TRACKING_CONFIDENCE = 0.5
+    MODEL_COMPLEXITY = 0
+    
+    # Gesture thresholds
+    PINCH_THRESHOLD = 0.05
+    FINGER_TIP_INDICES = [8, 12, 16, 20]
+    FINGER_PIP_INDICES = [6, 10, 14, 18]
 
 
-def is_eraser_gesture(hand_landmarks):
-    """
-    Eraser: ALL four fingers (index, middle, ring, pinky) up.
-    """
-    lm = hand_landmarks.landmark
-    fingers_up = get_fingers_up(lm)
-    return all(fingers_up)
+# ==================== GESTURE DETECTION ====================
+class GestureDetector:
+    @staticmethod
+    def get_fingers_up(landmarks):
+        """Returns [index_up, middle_up, ring_up, pinky_up]"""
+        fingers = []
+        for tip, pip in zip(Config.FINGER_TIP_INDICES, Config.FINGER_PIP_INDICES):
+            fingers.append(landmarks[tip].y < landmarks[pip].y)
+        return fingers
+    
+    @staticmethod
+    def is_eraser_gesture(hand_landmarks):
+        """Eraser: ALL four fingers up"""
+        fingers = GestureDetector.get_fingers_up(hand_landmarks.landmark)
+        return all(fingers)
+    
+    @staticmethod
+    def is_index_only_up(hand_landmarks):
+        """Pen DOWN: ONLY index up"""
+        fingers = GestureDetector.get_fingers_up(hand_landmarks.landmark)
+        return fingers[0] and not any(fingers[1:])
+    
+    @staticmethod
+    def is_pinch_gesture(hand_landmarks):
+        """Pinch = PEN UP"""
+        lm = hand_landmarks.landmark
+        index_tip = np.array([lm[8].x, lm[8].y])
+        thumb_tip = np.array([lm[4].x, lm[4].y])
+        return np.linalg.norm(index_tip - thumb_tip) < Config.PINCH_THRESHOLD
 
 
-def is_index_only_up_gesture(hand_landmarks):
-    """
-    Pen DOWN: ONLY index up, others down.
-    """
-    lm = hand_landmarks.landmark
-    fingers_up = get_fingers_up(lm)
+# ==================== DRAWING ENGINE ====================
+class DrawingEngine:
+    def __init__(self, height, width):
+        self.canvas = np.zeros((height, width, 3), dtype=np.uint8)
+        self.strokes = []
+        self.current_stroke = None
+    
+    def clear(self):
+        """Clear canvas completely"""
+        self.canvas[:] = 0
+        self.strokes.clear()
+        self.current_stroke = None
+    
+    def soft_clear(self):
+        """Fade canvas"""
+        self.canvas = (self.canvas * 0.7).astype(np.uint8)
+    
+    def undo(self):
+        """Remove last stroke"""
+        if self.current_stroke:
+            self.strokes.append(self.current_stroke)
+            self.current_stroke = None
+        if self.strokes:
+            self.strokes.pop()
+            self.redraw()
+    
+    def save(self):
+        """Save canvas to file"""
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"air_note_{timestamp}.png"
+        cv2.imwrite(filename, self.canvas)
+        return filename
+    
+    def start_stroke(self, mode, color, thickness):
+        """Start a new stroke"""
+        self.current_stroke = {
+            "mode": mode,
+            "color": color,
+            "thickness": thickness,
+            "points": []
+        }
+    
+    def add_point(self, point):
+        """Add point to current stroke"""
+        if self.current_stroke:
+            self.current_stroke["points"].append(point)
+    
+    def finish_stroke(self, apply_shape_correction=False):
+        """Finish current stroke and optionally apply shape correction"""
+        if not self.current_stroke:
+            return
+        
+        if apply_shape_correction and self.current_stroke["mode"] == "draw":
+            pts = self.current_stroke["points"]
+            if len(pts) >= 5:
+                shape_type, shape_params = autocorrect_stroke(pts)
+                if shape_type:
+                    print(f"[SHAPE] Detected {shape_type}!")
+                    self.strokes.append({
+                        "mode": "shape",
+                        "shape_type": shape_type,
+                        "shape_params": shape_params,
+                        "color": self.current_stroke["color"],
+                        "thickness": self.current_stroke["thickness"]
+                    })
+                    self.current_stroke = None
+                    self.redraw()
+                    return
+                else:
+                    print(f"[SHAPE] No shape detected (points: {len(pts)})")
+        
+        self.strokes.append(self.current_stroke)
+        self.current_stroke = None
+        self.redraw()
+    
+    def draw_line_to(self, prev_point, current_point, color, thickness):
+        """Draw line segment"""
+        if prev_point:
+            cv2.line(self.canvas, prev_point, current_point, color, thickness)
+    
+    def redraw(self):
+        """Redraw entire canvas from stroke history"""
+        self.canvas[:] = 0
+        
+        for stroke in self.strokes:
+            mode = stroke["mode"]
+            
+            if mode == "draw":
+                self._draw_stroke(stroke)
+            elif mode == "erase":
+                self._erase_stroke(stroke)
+            elif mode == "shape":
+                self._draw_shape(stroke)
+    
+    def _draw_stroke(self, stroke):
+        """Draw a freehand stroke"""
+        pts = stroke["points"]
+        if len(pts) < 2:
+            return
+        
+        color = stroke["color"]
+        thickness = stroke["thickness"]
+        
+        for i in range(1, len(pts)):
+            cv2.line(self.canvas, pts[i-1], pts[i], color, thickness)
+    
+    def _erase_stroke(self, stroke):
+        """Apply eraser stroke"""
+        pts = stroke["points"]
+        if len(pts) < 2:
+            return
+        
+        thickness = stroke["thickness"]
+        for i in range(1, len(pts)):
+            cv2.line(self.canvas, pts[i-1], pts[i], (0, 0, 0), thickness)
+    
+    def _draw_shape(self, stroke):
+        """Draw recognized shape"""
+        shape_type = stroke["shape_type"]
+        params = stroke["shape_params"]
+        color = stroke["color"]
+        thickness = stroke["thickness"]
+        
+        if shape_type == "line":
+            x1, y1, x2, y2 = params
+            cv2.line(self.canvas, (int(x1), int(y1)), (int(x2), int(y2)),
+                    color, thickness, cv2.LINE_AA)
+        
+        elif shape_type == "circle":
+            cx, cy, r = params
+            cv2.circle(self.canvas, (int(cx), int(cy)), int(r),
+                      color, thickness, cv2.LINE_AA)
+        
+        elif shape_type in ("rectangle", "square"):
+            corners = [(int(x), int(y)) for x, y in params]
+            pts = np.array(corners + [corners[0]], dtype=np.int32)
+            cv2.polylines(self.canvas, [pts], True, color, thickness, cv2.LINE_AA)
 
-    index_up = fingers_up[0]
-    others_up = any(fingers_up[1:])
-    return index_up and not others_up
+
+# ==================== STATE MANAGER ====================
+class StateManager:
+    def __init__(self):
+        self.current_color = Config.COLOR_WHITE
+        self.brush_thickness = Config.DEFAULT_BRUSH_THICKNESS
+        self.whiteboard_mode = False
+        self.recording = False
+        self.video_writer = None
+        
+        # Tracking
+        self.prev_point = None
+        self.lost_frames = 0
+        self.smooth_window = deque(maxlen=Config.SMOOTH_WINDOW)
+        
+        # Mode stability
+        self.prev_stable_mode = None
+        self.raw_mode_prev = None
+        self.mode_stable_count = 0
+    
+    def smooth_point(self, new_point):
+        """Smooth point using moving average"""
+        self.smooth_window.append(new_point)
+        xs = [p[0] for p in self.smooth_window]
+        ys = [p[1] for p in self.smooth_window]
+        return (int(sum(xs) / len(xs)), int(sum(ys) / len(ys)))
+    
+    def stabilize_mode(self, raw_mode):
+        """Apply gesture debouncing"""
+        if raw_mode == self.raw_mode_prev:
+            self.mode_stable_count = min(self.mode_stable_count + 1, 
+                                        Config.MODE_STABLE_FRAMES)
+        else:
+            self.raw_mode_prev = raw_mode
+            self.mode_stable_count = 1
+        
+        if self.mode_stable_count >= Config.MODE_STABLE_FRAMES:
+            return raw_mode
+        return self.prev_stable_mode
+    
+    def reset_tracking(self):
+        """Reset hand tracking state"""
+        self.prev_point = None
+        self.smooth_window.clear()
+    
+    def cycle_color(self):
+        """Cycle through available colors"""
+        colors = [Config.COLOR_WHITE, Config.COLOR_RED, 
+                 Config.COLOR_GREEN, Config.COLOR_BLUE]
+        try:
+            idx = colors.index(self.current_color)
+            self.current_color = colors[(idx + 1) % len(colors)]
+        except ValueError:
+            self.current_color = Config.COLOR_WHITE
+        return self.get_color_name()
+    
+    def adjust_thickness(self, delta):
+        """Adjust brush thickness"""
+        self.brush_thickness = max(Config.MIN_BRUSH, 
+                                   min(Config.MAX_BRUSH, 
+                                       self.brush_thickness + delta))
+    
+    def get_color_name(self):
+        """Get current color name"""
+        color_map = {
+            Config.COLOR_WHITE: "White",
+            Config.COLOR_RED: "Red",
+            Config.COLOR_GREEN: "Green",
+            Config.COLOR_BLUE: "Blue"
+        }
+        return color_map.get(self.current_color, "Custom")
 
 
-def is_pinch_gesture(hand_landmarks):
-    """
-    Pinch (thumb + index close) = PEN UP.
-    """
-    lm = hand_landmarks.landmark
-
-    index_tip = np.array([lm[8].x, lm[8].y])
-    thumb_tip = np.array([lm[4].x, lm[4].y])
-
-    distance = np.linalg.norm(index_tip - thumb_tip)
-    return distance < 0.05  # tune if needed
-
-
-def smooth_point(points_window, new_point):
-    """
-    Add new_point to window, keep last N, return averaged (x, y).
-    """
-    points_window.append(new_point)
-    if len(points_window) > SMOOTH_WINDOW:
-        points_window.pop(0)
-    xs = [p[0] for p in points_window]
-    ys = [p[1] for p in points_window]
-    return int(sum(xs) / len(xs)), int(sum(ys) / len(ys))
-
-
-# Stroke replay (for undo / shapes)
-
-def redraw_canvas_from_strokes(canvas, strokes):
-    canvas[:] = 0
-    for stroke in strokes:
-        mode = stroke["mode"]
-
-        if mode == "draw":
-            pts = stroke["points"]
-            if len(pts) < 2:
-                continue
-            color = stroke["color"]
-            thickness = stroke["thickness"]
-            for i in range(1, len(pts)):
-                cv2.line(canvas, pts[i - 1], pts[i], color, thickness)
-
-        elif mode == "erase":
-            pts = stroke["points"]
-            if len(pts) < 2:
-                continue
-            thickness = stroke["thickness"]
-            for i in range(1, len(pts)):
-                cv2.line(canvas, pts[i - 1], pts[i], (0, 0, 0), thickness)
-
-        elif mode == "shape":
-            shape_type = stroke["shape_type"]
-            params = stroke["shape_params"]
-            color = stroke["color"]
-            thickness = stroke["thickness"]
-
-            if shape_type == "line":
-                x1, y1, x2, y2 = params
-                cv2.line(canvas, (int(x1), int(y1)), (int(x2), int(y2)),
-                         color, thickness, cv2.LINE_AA)
-
-            elif shape_type == "circle":
-                cx, cy, r = params
-                cv2.circle(canvas, (int(cx), int(cy)), int(r),
-                           color, thickness, cv2.LINE_AA)
-
-            elif shape_type in ("rectangle", "square"):
-                corners = [(int(x), int(y)) for x, y in params]
-                pts = np.array(corners + [corners[0]], dtype=np.int32)
-                cv2.polylines(canvas, [pts], True, color, thickness, cv2.LINE_AA)
+# ==================== UI RENDERER ====================
+class UIRenderer:
+    @staticmethod
+    def draw_info(frame, state, mode):
+        """Draw information overlay"""
+        mode_text_map = {
+            "erase": "MODE: ERASER (Open Palm)",
+            "draw": "MODE: DRAW (Index only)",
+            None: "MODE: PEN UP (Pinch / idle)"
+        }
+        
+        info_lines = [
+            mode_text_map.get(mode, "MODE: Unknown"),
+            f"Color: {state.get_color_name()}  | Thickness: {state.brush_thickness}",
+            "Keys: C=Clear, B=Soft Clear, S=Save, Z=Undo, 1-4 Colors, +/- Thickness, W Whiteboard, R Record, Q Quit"
+        ]
+        
+        y_pos = 25
+        for line in info_lines:
+            cv2.putText(frame, line, (10, y_pos), 
+                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 1, cv2.LINE_AA)
+            y_pos += 25
+    
+    @staticmethod
+    def draw_pointer(frame, point):
+        """Draw finger pointer"""
+        if point:
+            cv2.circle(frame, point, 4, (0, 255, 0), 1)
 
 
-# Main
-
-cap = cv2.VideoCapture(0)
-if not cap.isOpened():
-    print("Error: Could not open webcam.")
-    raise SystemExit
-
-ret, frame = cap.read()
-if not ret:
-    print("Error: Could not read from webcam.")
-    cap.release()
-    raise SystemExit
-
-h, w, _ = frame.shape
-canvas = np.zeros((h, w, 3), dtype=np.uint8)
-
-prev_x, prev_y = None, None
-lost_frames = 0
-
-# Drawing state
-current_color = COLOR_WHITE
-brush_thickness = DEFAULT_BRUSH_THICKNESS
-whiteboard_mode = False
-
-strokes = []           # history of strokes
-current_stroke = None  # active stroke
-prev_mode = None       # previous STABLE mode: None / "draw" / "erase"
-smooth_window = []     # for smoothing
-
-# Gesture mode smoothing
-raw_mode_prev = None
-mode_stable_count = 0  # how long current raw mode has been seen
-
-# Recording
-recording = False
-video_writer = None
-
-hands = mp_hands.Hands(
-    static_image_mode=False,
-    max_num_hands=MAX_NUM_HANDS,
-    min_detection_confidence=0.4,
-    min_tracking_confidence=0.4,
-    model_complexity=0,   # faster
-)
-
-print("Press 'c' to clear, 'b' to soft clear, 's' to save, 'z' to undo,")
-print("'1-4' to change color, '+/-' to change thickness, 'w' whiteboard mode, 'r' record, 'q' quit.")
-print("GESTURES:")
-print("- ONLY index finger up      = PEN DOWN (draw)")
-print("- Pinch (thumb + index)     = PEN UP (no draw)")
-print("- Open palm (4 fingers up)  = ERASER")
-
-cv2.namedWindow("Air Writing", cv2.WINDOW_NORMAL)
-
-while True:
-    ret, frame = cap.read()
-    if not ret:
-        print("Frame not received, exiting.")
-        break
-
-    frame = cv2.flip(frame, 1)
-    rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-    result = hands.process(rgb)
-
-    index_tip_point = None
-    eraser_mode = False
-    raw_mode = None  # "draw" / "erase" / None
-
-    if result.multi_hand_landmarks:
-        lost_frames = 0
+# ==================== MAIN APPLICATION ====================
+class AirWritingApp:
+    def __init__(self):
+        self.cap = cv2.VideoCapture(0)
+        if not self.cap.isOpened():
+            raise RuntimeError("Error: Could not open webcam.")
+        
+        ret, frame = self.cap.read()
+        if not ret:
+            self.cap.release()
+            raise RuntimeError("Error: Could not read from webcam.")
+        
+        h, w = frame.shape[:2]
+        self.width, self.height = w, h
+        
+        self.drawing_engine = DrawingEngine(h, w)
+        self.state = StateManager()
+        self.gesture_detector = GestureDetector()
+        
+        self.hands = mp_hands.Hands(
+            static_image_mode=False,
+            max_num_hands=Config.MAX_NUM_HANDS,
+            min_detection_confidence=Config.DETECTION_CONFIDENCE,
+            min_tracking_confidence=Config.TRACKING_CONFIDENCE,
+            model_complexity=Config.MODEL_COMPLEXITY
+        )
+        
+        self.print_instructions()
+    
+    def print_instructions(self):
+        """Print usage instructions"""
+        print("\n" + "="*60)
+        print("AIR WRITING - Instructions")
+        print("="*60)
+        print("\nKEYBOARD CONTROLS:")
+        print("  C - Clear canvas completely")
+        print("  B - Soft clear (fade)")
+        print("  S - Save canvas to file")
+        print("  Z - Undo last stroke")
+        print("  1-4 - Change color (White/Red/Green/Blue)")
+        print("  +/- - Adjust brush thickness")
+        print("  W - Toggle whiteboard mode")
+        print("  R - Start/Stop recording")
+        print("  Q - Quit application")
+        print("\nGESTURES:")
+        print("  Index finger only - Draw mode")
+        print("  Pinch (thumb + index) - Pen up (no drawing)")
+        print("  Open palm (4 fingers) - Eraser mode")
+        print("="*60 + "\n")
+    
+    def process_hand_detection(self, frame):
+        """Process hand detection and return gesture info"""
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        result = self.hands.process(rgb)
+        
+        if not result.multi_hand_landmarks:
+            self.state.lost_frames += 1
+            if self.state.lost_frames > Config.MAX_LOST_FRAMES:
+                self.state.reset_tracking()
+            return None, None
+        
+        self.state.lost_frames = 0
         hand_landmarks = result.multi_hand_landmarks[0]
-
-        # Comment this out if you need more FPS
-        mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
-
-        eraser_mode = is_eraser_gesture(hand_landmarks)
-        pinch = is_pinch_gesture(hand_landmarks)
-        index_only = is_index_only_up_gesture(hand_landmarks)
-
-        # RAW mode from gestures (will be stabilized below)
-        if eraser_mode:
+        
+        # Optional: Draw hand landmarks (comment out for better performance)
+        # mp_drawing.draw_landmarks(frame, hand_landmarks, mp_hands.HAND_CONNECTIONS)
+        
+        # Detect gestures
+        if self.gesture_detector.is_eraser_gesture(hand_landmarks):
             raw_mode = "erase"
-        elif pinch:
-            raw_mode = None  # pen up
-        elif index_only:
+        elif self.gesture_detector.is_pinch_gesture(hand_landmarks):
+            raw_mode = None
+        elif self.gesture_detector.is_index_only_up(hand_landmarks):
             raw_mode = "draw"
         else:
             raw_mode = None
-
+        
+        # Get and smooth index finger position
         lm = hand_landmarks.landmark
-        raw_x = int(lm[8].x * w)
-        raw_y = int(lm[8].y * h)
-
-        # Smooth the pointer in image space
-        sm_x, sm_y = smooth_point(smooth_window, (raw_x, raw_y))
-        index_tip_point = (sm_x, sm_y)
-
-        # Pointer exactly at drawing position, a bit smaller now
-        cv2.circle(frame, (sm_x, sm_y), 4, (0, 255, 0), 1)
-
-    else:
-        lost_frames += 1
-        raw_mode = None
-        if lost_frames > MAX_LOST_FRAMES:
-            prev_x, prev_y = None, None
-            smooth_window = []
-
-    # --------- STABILIZE MODE (gesture debouncing) ----------
-
-    # Update stable counter for raw_mode
-    if raw_mode == raw_mode_prev:
-        mode_stable_count = min(mode_stable_count + 1, MODE_STABLE_FRAMES)
-    else:
-        raw_mode_prev = raw_mode
-        mode_stable_count = 1
-
-    # Decide actual mode used for drawing/erasing
-    if mode_stable_count >= MODE_STABLE_FRAMES:
-        mode = raw_mode
-    else:
-        # keep previous stable mode until new raw_mode is stable enough
-        mode = prev_mode
-
-    # --------- Handle stroke state (start/end/current) ----------
-
-    if mode != prev_mode:
-        # Close previous stroke cleanly
-        if prev_mode == "draw" and current_stroke is not None:
-            pts = current_stroke["points"]
-
-            # Only try shape autocorrect if stroke has enough points
-            if len(pts) >= 5:
-                shape_type, shape_params = autocorrect_stroke(pts)
-            else:
-                shape_type, shape_params = (None, None)
-
-            if shape_type is not None:
-                shape_stroke = {
-                    "mode": "shape",
-                    "shape_type": shape_type,
-                    "shape_params": shape_params,
-                    "color": current_stroke["color"],
-                    "thickness": current_stroke["thickness"]
-                }
-                strokes.append(shape_stroke)
-            else:
-                strokes.append(current_stroke)
-
-            current_stroke = None
-            redraw_canvas_from_strokes(canvas, strokes)
-
-        elif prev_mode == "erase" and current_stroke is not None:
-            strokes.append(current_stroke)
-            current_stroke = None
-            redraw_canvas_from_strokes(canvas, strokes)
-
-        # Start new stroke if actually in a stable drawing/erasing mode
-        if mode in ("draw", "erase") and index_tip_point is not None:
-            current_stroke = {
-                "mode": mode,
-                "color": current_color,
-                "thickness": brush_thickness if mode == "draw" else ERASER_THICKNESS,
-                "points": []
-            }
-            smooth_window = []  # reset smoothing for new stroke
-
-        prev_mode = mode  # update stable previous mode AFTER handling transitions
-
-    # --------- Drawing / Erasing Logic ----------
-
-    if index_tip_point is not None:
-        x, y = index_tip_point
-
-        if mode == "erase":
-            if prev_x is not None and prev_y is not None:
-                cv2.line(canvas, (prev_x, prev_y), (x, y), (0, 0, 0), ERASER_THICKNESS)
-            if current_stroke is not None:
-                current_stroke["points"].append((x, y))
-            prev_x, prev_y = x, y
-
-        elif mode == "draw":
-            if prev_x is not None and prev_y is not None:
-                cv2.line(canvas, (prev_x, prev_y),
-                         (x, y),
-                         current_stroke["color"],
-                         current_stroke["thickness"])
-            if current_stroke is not None:
-                current_stroke["points"].append((x, y))
-            prev_x, prev_y = x, y
-
-        else:
-            prev_x, prev_y = None, None
-    else:
-        prev_x, prev_y = None, None
-
-    # --------- Overlay + UI / Toolbar ----------
-
-    combined = cv2.addWeighted(frame, 0.5, canvas, 0.5, 0)
-
-    if mode == "erase":
-        mode_text = "MODE: ERASER (Open Palm)"
-    elif mode == "draw":
-        mode_text = "MODE: DRAW (Index only)"
-    else:
-        mode_text = "MODE: PEN UP (Pinch / idle)"
-
-    color_name = {
-        COLOR_WHITE: "White",
-        COLOR_RED: "Red",
-        COLOR_GREEN: "Green",
-        COLOR_BLUE: "Blue"
-    }.get(current_color, "Custom")
-
-    info_lines = [
-        mode_text,
-        f"Color: {color_name}  | Thickness: {brush_thickness}",
-        "Keys: C=Clear, B=Soft Clear, S=Save, Z=Undo, 1-4 Colors, +/- Thickness, W Whiteboard, R Record, Q Quit",
-        "Gestures: Index=Draw, Pinch=Pen Up, Open Palm=Eraser"
-    ]
-
-    display_frame = canvas if whiteboard_mode else combined
-
-    y0 = 25
-    for i, line in enumerate(info_lines):
-        cv2.putText(
-            display_frame,
-            line,
-            (10, y0 + i * 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (0, 255, 0),
-            1,
-            cv2.LINE_AA,
-        )
-
-    # Recording
-    if recording:
-        if video_writer is None:
-            fourcc = cv2.VideoWriter_fourcc(*"XVID")
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"air_session_{timestamp}.avi"
-            video_writer = cv2.VideoWriter(filename, fourcc, 20.0, (w, h))
-            print(f"[INFO] Recording started: {filename}")
-        video_writer.write(display_frame)
-    else:
-        if video_writer is not None:
-            video_writer.release()
-            video_writer = None
-            print("[INFO] Recording stopped.")
-
-    cv2.imshow("Air Writing", display_frame)
-    cv2.imshow("Canvas", canvas)
-
-    # --------- Key handling ----------
-
-    key = cv2.waitKey(1) & 0xFF
-
-    if key == ord('q'):
-        break
-
-    if key == ord('c'):
-        canvas[:] = 0
-        strokes.clear()
-        current_stroke = None
-        print("[INFO] Canvas cleared.")
-
-    if key == ord('b'):
-        canvas = (canvas * 0.7).astype(np.uint8)
-        print("[INFO] Soft clear (fade) applied.")
-
-    if key == ord('s'):
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = f"air_note_{timestamp}.png"
-        cv2.imwrite(filename, canvas)
-        print(f"[INFO] Canvas saved as {filename}")
-
-    if key == ord('z'):
-        # finish current stroke before undo (no need to autocorrect here, we remove it anyway)
-        if current_stroke is not None:
-            strokes.append(current_stroke)
-            current_stroke = None
-            prev_mode = None
-        if strokes:
-            strokes.pop()
-            redraw_canvas_from_strokes(canvas, strokes)
+        raw_x = int(lm[8].x * self.width)
+        raw_y = int(lm[8].y * self.height)
+        smoothed_point = self.state.smooth_point((raw_x, raw_y))
+        
+        return raw_mode, smoothed_point
+    
+    def handle_mode_transition(self, old_mode, new_mode, has_point):
+        """Handle transitions between drawing modes"""
+        if old_mode == new_mode:
+            return
+        
+        # Finish previous stroke
+        if old_mode in ("draw", "erase"):
+            self.drawing_engine.finish_stroke(apply_shape_correction=(old_mode == "draw"))
+        
+        # Start new stroke
+        if new_mode in ("draw", "erase") and has_point:
+            thickness = (Config.ERASER_THICKNESS if new_mode == "erase" 
+                        else self.state.brush_thickness)
+            self.drawing_engine.start_stroke(new_mode, self.state.current_color, thickness)
+            self.state.smooth_window.clear()
+        
+        self.state.prev_stable_mode = new_mode
+    
+    def handle_drawing(self, mode, current_point):
+        """Handle drawing/erasing based on current mode"""
+        if not current_point or mode not in ("draw", "erase"):
+            self.state.prev_point = None
+            return
+        
+        color = (0, 0, 0) if mode == "erase" else self.state.current_color
+        thickness = (Config.ERASER_THICKNESS if mode == "erase" 
+                    else self.state.brush_thickness)
+        
+        if self.state.prev_point:
+            self.drawing_engine.draw_line_to(self.state.prev_point, current_point, 
+                                            color, thickness)
+        
+        self.drawing_engine.add_point(current_point)
+        self.state.prev_point = current_point
+    
+    def handle_keyboard(self, key):
+        """Handle keyboard input"""
+        if key == ord('q'):
+            return False
+        
+        if key == ord('c'):
+            self.drawing_engine.clear()
+            print("[INFO] Canvas cleared.")
+        
+        elif key == ord('b'):
+            self.drawing_engine.soft_clear()
+            print("[INFO] Soft clear applied.")
+        
+        elif key == ord('s'):
+            filename = self.drawing_engine.save()
+            print(f"[INFO] Canvas saved as {filename}")
+        
+        elif key == ord('z'):
+            self.drawing_engine.undo()
             print("[INFO] Undo last stroke.")
+        
+        elif key in [ord('1'), ord('2'), ord('3'), ord('4')]:
+            colors = [Config.COLOR_WHITE, Config.COLOR_RED, 
+                     Config.COLOR_GREEN, Config.COLOR_BLUE]
+            self.state.current_color = colors[key - ord('1')]
+        
+        elif key in [ord('+'), ord('=')]:
+            self.state.adjust_thickness(1)
+        
+        elif key in [ord('-'), ord('_')]:
+            self.state.adjust_thickness(-1)
+        
+        elif key == ord('w'):
+            self.state.whiteboard_mode = not self.state.whiteboard_mode
+            print(f"[INFO] Whiteboard mode: {self.state.whiteboard_mode}")
+        
+        elif key == ord('r'):
+            self.state.recording = not self.state.recording
+            if self.state.recording:
+                self.start_recording()
+            else:
+                self.stop_recording()
+        
+        return True
+    
+    def start_recording(self):
+        """Start video recording"""
+        fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        filename = f"air_session_{timestamp}.mp4"
+        self.state.video_writer = cv2.VideoWriter(
+            filename, fourcc, 20.0, (self.width, self.height))
+        print(f"[INFO] Recording started: {filename}")
+    
+    def stop_recording(self):
+        """Stop video recording"""
+        if self.state.video_writer:
+            self.state.video_writer.release()
+            self.state.video_writer = None
+            print("[INFO] Recording stopped.")
+    
+    def run(self):
+        """Main application loop"""
+        cv2.namedWindow("Air Writing", cv2.WINDOW_NORMAL)
+        
+        try:
+            while True:
+                ret, frame = self.cap.read()
+                if not ret:
+                    print("Frame not received, exiting.")
+                    break
+                
+                frame = cv2.flip(frame, 1)
+                
+                # Process hand detection
+                raw_mode, current_point = self.process_hand_detection(frame)
+                
+                # Stabilize mode
+                stable_mode = self.state.stabilize_mode(raw_mode)
+                
+                # Handle mode transitions
+                self.handle_mode_transition(self.state.prev_stable_mode, 
+                                           stable_mode, current_point is not None)
+                
+                # Handle drawing/erasing
+                self.handle_drawing(stable_mode, current_point)
+                
+                # Render UI
+                combined = cv2.addWeighted(frame, 0.5, self.drawing_engine.canvas, 0.5, 0)
+                display_frame = (self.drawing_engine.canvas if self.state.whiteboard_mode 
+                               else combined)
+                
+                UIRenderer.draw_info(display_frame, self.state, stable_mode)
+                UIRenderer.draw_pointer(frame if not self.state.whiteboard_mode else display_frame, 
+                                       current_point)
+                
+                # Recording
+                if self.state.recording and self.state.video_writer:
+                    self.state.video_writer.write(display_frame)
+                
+                cv2.imshow("Air Writing", display_frame)
+                cv2.imshow("Canvas", self.drawing_engine.canvas)
+                
+                # Handle keyboard
+                key = cv2.waitKey(1) & 0xFF
+                if not self.handle_keyboard(key):
+                    break
+        
+        finally:
+            self.cleanup()
+    
+    def cleanup(self):
+        """Cleanup resources"""
+        # Finish any active stroke
+        if self.drawing_engine.current_stroke:
+            self.drawing_engine.finish_stroke(
+                apply_shape_correction=(self.drawing_engine.current_stroke["mode"] == "draw"))
+        
+        self.hands.close()
+        self.cap.release()
+        if self.state.video_writer:
+            self.state.video_writer.release()
+        cv2.destroyAllWindows()
+        print("\n[INFO] Application closed successfully.")
 
-    # Colors
-    if key == ord('1'):
-        current_color = COLOR_WHITE
-    if key == ord('2'):
-        current_color = COLOR_RED
-    if key == ord('3'):
-        current_color = COLOR_GREEN
-    if key == ord('4'):
-        current_color = COLOR_BLUE
 
-    # Thickness
-    if key == ord('+') or key == ord('='):
-        brush_thickness = min(MAX_BRUSH, brush_thickness + 1)
-    if key == ord('-') or key == ord('_'):
-        brush_thickness = max(MIN_BRUSH, brush_thickness - 1)
-
-    if key == ord('w'):
-        whiteboard_mode = not whiteboard_mode
-        print(f"[INFO] Whiteboard mode: {whiteboard_mode}")
-
-    if key == ord('r'):
-        recording = not recording
-        # start/stop handled in loop
-
-# Close any remaining active stroke
-if current_stroke is not None:
-    if current_stroke["mode"] == "draw":
-        pts = current_stroke["points"]
-        if len(pts) >= 5:
-            shape_type, shape_params = autocorrect_stroke(pts)
-        else:
-            shape_type, shape_params = (None, None)
-        if shape_type is not None:
-            strokes.append({
-                "mode": "shape",
-                "shape_type": shape_type,
-                "shape_params": shape_params,
-                "color": current_stroke["color"],
-                "thickness": current_stroke["thickness"]
-            })
-        else:
-            strokes.append(current_stroke)
-    else:
-        strokes.append(current_stroke)
-
-hands.close()
-cap.release()
-if video_writer is not None:
-    video_writer.release()
-cv2.destroyAllWindows()
+# ==================== ENTRY POINT ====================
+if __name__ == "__main__":
+    try:
+        app = AirWritingApp()
+        app.run()
+    except Exception as e:
+        print(f"[ERROR] {e}")
+        raise
